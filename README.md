@@ -2,6 +2,8 @@
 
 A Blender/Bforartists extension that adds an AI-powered Python assistant to the Text Editor. Claude lives in the sidebar and can read your scripts, inspect the scene, execute code, and write scripts — all from a chat interface.
 
+![Screenshot](Screen.png)
+
 ## Features
 
 - **Text Editor integration** — panel in the N-panel sidebar, right next to your code
