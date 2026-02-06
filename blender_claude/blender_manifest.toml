@@ -1,0 +1,18 @@
+schema_version = "1.0.0"
+
+id = "blender_claude"
+version = "0.1.0"
+name = "Claude Code"
+tagline = "AI-powered Python assistant using Claude"
+maintainer = "Pawel Piecuch"
+type = "add-on"
+
+blender_version_min = "4.2.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+
+[permissions]
+network = "Sends prompts to Anthropic Claude API"
+files = "Reads and writes Python scripts"

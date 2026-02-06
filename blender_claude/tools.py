@@ -1,0 +1,337 @@
+"""Blender tool definitions for Claude's tool-use API.
+
+Each tool has:
+- A definition dict (sent to the API)
+- An execution function (runs on Blender's main thread)
+"""
+
+import io
+import json
+import contextlib
+import traceback
+
+import bpy
+
+
+# ---------------------------------------------------------------------------
+# Tool definitions (Anthropic format)
+# ---------------------------------------------------------------------------
+
+TOOL_DEFINITIONS = [
+    {
+        "name": "get_scene_info",
+        "description": (
+            "Get an overview of the current Blender scene: object names, types, "
+            "locations, active object, selected objects, and scene settings."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
+        "name": "get_object_info",
+        "description": (
+            "Get detailed information about a specific object: transforms, mesh stats "
+            "(vertices/faces/edges), materials, modifiers, constraints, and parent/children."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Exact name of the object in bpy.data.objects",
+                },
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "execute_python",
+        "description": (
+            "Execute Python code in Blender. The code has access to bpy, mathutils, "
+            "and bmesh. Returns stdout output and any errors. An undo step is created "
+            "before execution. Use this for creating/modifying objects, materials, etc."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "Python code to execute",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Brief description of what the code does (for undo label)",
+                },
+            },
+            "required": ["code"],
+        },
+    },
+    {
+        "name": "read_text_block",
+        "description": (
+            "Read the contents of a text data block from Blender's Text Editor. "
+            "Use this to examine scripts the user is working on."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Name of the text block (e.g. 'Script.py'). "
+                    "If empty, reads the active text block in the Text Editor.",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "write_text_block",
+        "description": (
+            "Create or replace a text data block in Blender's Text Editor. "
+            "Use this to write complete scripts for the user."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Name for the text block (e.g. 'MyScript.py')",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Full content to write",
+                },
+            },
+            "required": ["name", "content"],
+        },
+    },
+]
+
+
+# ---------------------------------------------------------------------------
+# Tool execution (all run on main thread via bridge)
+# ---------------------------------------------------------------------------
+
+def execute_tool(name, tool_input):
+    """Dispatch a tool call. Returns a result string."""
+    dispatch = {
+        "get_scene_info": _tool_get_scene_info,
+        "get_object_info": _tool_get_object_info,
+        "execute_python": _tool_execute_python,
+        "read_text_block": _tool_read_text_block,
+        "write_text_block": _tool_write_text_block,
+    }
+    fn = dispatch.get(name)
+    if fn is None:
+        return json.dumps({"error": f"Unknown tool: {name}"})
+    try:
+        return fn(tool_input)
+    except Exception as e:
+        return json.dumps({
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+        })
+
+
+def _tool_get_scene_info(_input):
+    scene = bpy.context.scene
+    vl = bpy.context.view_layer
+
+    objects = []
+    for obj in scene.objects:
+        info = {
+            "name": obj.name,
+            "type": obj.type,
+            "location": [round(v, 3) for v in obj.location],
+            "visible": obj.visible_get(),
+        }
+        if obj == vl.objects.active:
+            info["active"] = True
+        if obj.select_get():
+            info["selected"] = True
+        objects.append(info)
+
+    result = {
+        "scene_name": scene.name,
+        "frame_current": scene.frame_current,
+        "frame_range": [scene.frame_start, scene.frame_end],
+        "object_count": len(objects),
+        "objects": objects[:50],  # Cap at 50
+        "active_object": vl.objects.active.name if vl.objects.active else None,
+        "selected_count": len(bpy.context.selected_objects),
+        "render_engine": scene.render.engine,
+        "collections": [c.name for c in scene.collection.children],
+    }
+    if len(objects) > 50:
+        result["note"] = f"Showing first 50 of {len(objects)} objects"
+
+    return json.dumps(result, indent=2)
+
+
+def _tool_get_object_info(tool_input):
+    name = tool_input.get("name", "")
+    obj = bpy.data.objects.get(name)
+    if obj is None:
+        return json.dumps({"error": f"Object '{name}' not found"})
+
+    info = {
+        "name": obj.name,
+        "type": obj.type,
+        "location": [round(v, 3) for v in obj.location],
+        "rotation_euler": [round(v, 4) for v in obj.rotation_euler],
+        "scale": [round(v, 3) for v in obj.scale],
+        "dimensions": [round(v, 3) for v in obj.dimensions],
+        "parent": obj.parent.name if obj.parent else None,
+        "children": [c.name for c in obj.children],
+        "visible": obj.visible_get(),
+        "selected": obj.select_get(),
+    }
+
+    # Mesh-specific
+    if obj.type == "MESH" and obj.data:
+        mesh = obj.data
+        info["mesh"] = {
+            "vertices": len(mesh.vertices),
+            "edges": len(mesh.edges),
+            "polygons": len(mesh.polygons),
+            "has_uv": len(mesh.uv_layers) > 0,
+            "uv_layers": [uv.name for uv in mesh.uv_layers],
+        }
+
+    # Materials
+    info["materials"] = []
+    for slot in obj.material_slots:
+        mat = slot.material
+        if mat:
+            mat_info = {"name": mat.name, "use_nodes": mat.use_nodes}
+            if mat.use_nodes and mat.node_tree:
+                mat_info["node_count"] = len(mat.node_tree.nodes)
+            info["materials"].append(mat_info)
+
+    # Modifiers
+    info["modifiers"] = []
+    for mod in obj.modifiers:
+        info["modifiers"].append({"name": mod.name, "type": mod.type})
+
+    # Constraints
+    info["constraints"] = []
+    for con in obj.constraints:
+        info["constraints"].append({"name": con.name, "type": con.type})
+
+    return json.dumps(info, indent=2)
+
+
+def _tool_execute_python(tool_input):
+    code = tool_input.get("code", "")
+    description = tool_input.get("description", "AI-generated code")
+
+    if not code.strip():
+        return json.dumps({"error": "No code provided"})
+
+    # Create undo step
+    try:
+        bpy.ops.ed.undo_push(message=f"Claude: {description[:50]}")
+    except Exception:
+        pass  # May fail outside of correct context
+
+    # Execute with stdout capture
+    stdout_capture = io.StringIO()
+    stderr_capture = io.StringIO()
+
+    namespace = {
+        "bpy": bpy,
+        "__builtins__": __builtins__,
+    }
+
+    # Lazily import optional modules into namespace
+    try:
+        import mathutils
+        namespace["mathutils"] = mathutils
+    except ImportError:
+        pass
+    try:
+        import bmesh
+        namespace["bmesh"] = bmesh
+    except ImportError:
+        pass
+
+    try:
+        with contextlib.redirect_stdout(stdout_capture), \
+             contextlib.redirect_stderr(stderr_capture):
+            exec(code, namespace)
+    except Exception as e:
+        return json.dumps({
+            "status": "error",
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+            "stdout": stdout_capture.getvalue(),
+            "stderr": stderr_capture.getvalue(),
+        })
+
+    return json.dumps({
+        "status": "success",
+        "stdout": stdout_capture.getvalue(),
+        "stderr": stderr_capture.getvalue(),
+    })
+
+
+def _tool_read_text_block(tool_input):
+    name = tool_input.get("name", "")
+
+    if not name:
+        # Try to get the active text block from a TEXT_EDITOR area
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type == "TEXT_EDITOR":
+                    space = area.spaces.active
+                    if space and space.text:
+                        name = space.text.name
+                        break
+            if name:
+                break
+
+    if not name:
+        return json.dumps({"error": "No text block name provided and no active text found"})
+
+    text = bpy.data.texts.get(name)
+    if text is None:
+        available = [t.name for t in bpy.data.texts]
+        return json.dumps({
+            "error": f"Text block '{name}' not found",
+            "available_texts": available,
+        })
+
+    return json.dumps({
+        "name": text.name,
+        "content": text.as_string(),
+        "line_count": len(text.lines),
+        "filepath": text.filepath or None,
+    })
+
+
+def _tool_write_text_block(tool_input):
+    name = tool_input.get("name", "Script.py")
+    content = tool_input.get("content", "")
+
+    text = bpy.data.texts.get(name)
+    created = text is None
+    if created:
+        text = bpy.data.texts.new(name)
+    text.clear()
+    text.write(content)
+
+    # Try to show it in a Text Editor area
+    for window in bpy.context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type == "TEXT_EDITOR":
+                area.spaces.active.text = text
+                break
+
+    return json.dumps({
+        "status": "created" if created else "updated",
+        "name": text.name,
+        "line_count": len(text.lines),
+    })
