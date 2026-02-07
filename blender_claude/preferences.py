@@ -1,4 +1,4 @@
-"""Addon preferences: API key, model selection, settings."""
+"""Addon preferences: API key, model selection, backend, settings."""
 
 import os
 import subprocess
@@ -65,8 +65,26 @@ def _read_keychain_api_key():
     return ""
 
 
+def _check_cli_available():
+    """Check if claude CLI is installed (cached)."""
+    import shutil
+    return shutil.which("claude") is not None
+
+
 class CLAUDE_AddonPreferences(bpy.types.AddonPreferences):
     bl_idname = __package__
+
+    backend: EnumProperty(
+        name="Backend",
+        description="How to connect to Claude",
+        items=[
+            ("CLI", "Claude Code CLI",
+             "Uses your Claude subscription (Pro/Max/Team). Requires 'claude' CLI installed"),
+            ("API", "Direct API",
+             "Uses prepaid API credits from console.anthropic.com. Requires API key"),
+        ],
+        default="CLI",
+    )  # type: ignore
 
     api_key: StringProperty(
         name="API Key",
@@ -77,7 +95,7 @@ class CLAUDE_AddonPreferences(bpy.types.AddonPreferences):
 
     model: EnumProperty(
         name="Model",
-        description="Claude model to use",
+        description="Claude model to use (API backend only; CLI uses its configured model)",
         items=[
             ("claude-sonnet-4-5-20250929", "Claude Sonnet 4.5", "Fast and capable (recommended)"),
             ("claude-opus-4-6", "Claude Opus 4.6", "Most capable, slower"),
@@ -88,7 +106,7 @@ class CLAUDE_AddonPreferences(bpy.types.AddonPreferences):
 
     max_tool_iterations: IntProperty(
         name="Max tool iterations",
-        description="Maximum number of tool-use round-trips per request",
+        description="Maximum tool-use round-trips per request (API backend only)",
         default=10,
         min=1,
         max=30,
@@ -96,7 +114,7 @@ class CLAUDE_AddonPreferences(bpy.types.AddonPreferences):
 
     max_tokens: IntProperty(
         name="Max tokens",
-        description="Maximum tokens in Claude's response",
+        description="Maximum tokens in Claude's response (API backend only)",
         default=4096,
         min=256,
         max=32768,
@@ -104,19 +122,35 @@ class CLAUDE_AddonPreferences(bpy.types.AddonPreferences):
 
     def draw(self, context):
         layout = self.layout
-        layout.prop(self, "api_key")
-        layout.prop(self, "model")
 
-        row = layout.row()
-        row.prop(self, "max_tool_iterations")
-        row.prop(self, "max_tokens")
+        # Backend selection
+        layout.prop(self, "backend")
 
-        key = self.get_api_key()
-        if key:
-            source = "preferences" if self.api_key else "auto-detected"
-            layout.label(text=f"API key: {source} (sk-ant-...{key[-4:]})", icon="CHECKMARK")
+        cli_ok = _check_cli_available()
+
+        if self.backend == "CLI":
+            if cli_ok:
+                layout.label(text="Claude CLI found - uses your subscription", icon="CHECKMARK")
+            else:
+                box = layout.box()
+                box.label(text="Claude CLI not found", icon="ERROR")
+                box.label(text="Install: npm install -g @anthropic-ai/claude-code")
+                box.label(text="Then run: claude login")
         else:
-            layout.label(text="No API key found. Set above, or ANTHROPIC_API_KEY env var.", icon="ERROR")
+            # API backend settings
+            layout.prop(self, "api_key")
+            layout.prop(self, "model")
+
+            row = layout.row()
+            row.prop(self, "max_tool_iterations")
+            row.prop(self, "max_tokens")
+
+            key = self.get_api_key()
+            if key:
+                source = "preferences" if self.api_key else "auto-detected"
+                layout.label(text=f"API key: {source} (sk-ant-...{key[-4:]})", icon="CHECKMARK")
+            else:
+                layout.label(text="No API key found. Set above or ANTHROPIC_API_KEY env var.", icon="ERROR")
 
     def get_api_key(self):
         """Get API key from preferences, environment, or macOS Keychain."""

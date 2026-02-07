@@ -46,6 +46,7 @@ class MainThreadBridge:
         self._timer_registered = False
         self._streaming_text = ""
         self._lock = threading.Lock()
+        self._poll_tick = 0
 
     # -- Streaming text (lockless-ish, updated frequently) --
 
@@ -90,6 +91,10 @@ class MainThreadBridge:
 
     def _process_queue(self):
         """Timer callback: drain the queue and update streaming UI."""
+        # Guard: if we've been unregistered, stop immediately
+        if not self._timer_registered:
+            return None  # Unregister timer
+
         # Process all queued functions
         processed = 0
         while not self._queue.empty() and processed < 50:
@@ -102,15 +107,29 @@ class MainThreadBridge:
 
         # Update streaming text in the UI property
         try:
-            scene = bpy.context.scene
+            scene = getattr(bpy.context, "scene", None)
+            if scene is None:
+                return 0.1
             claude_state = getattr(scene, "claude", None)
             if claude_state and claude_state.is_generating:
                 text = self.get_streaming_text()
                 if claude_state.streaming_text != text:
                     claude_state.streaming_text = text
                     _tag_redraw_text_editors()
-        except Exception:
+        except (ReferenceError, AttributeError):
             pass
+
+        # Poll workspace for external changes every ~2s (20 ticks × 100ms)
+        self._poll_tick += 1
+        if self._poll_tick >= 20:
+            self._poll_tick = 0
+            try:
+                from . import workspace as _ws
+                ws = _ws._workspace
+                if ws is not None:
+                    ws.poll_changes()
+            except Exception:
+                pass
 
         return 0.1  # Check every 100ms
 
@@ -122,12 +141,18 @@ class MainThreadBridge:
 
     def unregister(self):
         """Unregister the timer. Call from unregister()."""
-        if self._timer_registered:
-            try:
+        self._timer_registered = False  # Signal timer to stop on next tick
+        try:
+            if bpy.app.timers.is_registered(self._process_queue):
                 bpy.app.timers.unregister(self._process_queue)
-            except ValueError:
-                pass
-            self._timer_registered = False
+        except (ValueError, RuntimeError):
+            pass
+        # Drain remaining queue items to unblock any waiting threads
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
 
 
 def _tag_redraw_text_editors():

@@ -12,13 +12,15 @@ A Blender/Bforartists extension that adds an AI-powered Python assistant to the 
 - **Streaming responses** — see Claude's response as it's generated, non-blocking UI
 - **Code actions** — Apply, Run, or Copy generated code with one click
 - **Error self-correction** — failed code execution feeds errors back to Claude for automatic retry
+- **Dual backend** — use Claude Code CLI (subscription) or Direct API (prepaid credits)
 - **Zero dependencies** — uses only the `requests` library bundled with Blender
 - **Auto API key detection** — reads your API key from macOS Keychain (shared with Claude Code CLI)
 
 ## Requirements
 
 - Blender 4.2+ or Bforartists 4.2+ (uses the extensions manifest format)
-- Anthropic API key
+- **CLI backend**: Claude Code CLI installed (`npm install -g @anthropic-ai/claude-code`) with active subscription
+- **API backend**: Anthropic API key with prepaid credits
 
 ## Installation
 
@@ -38,15 +40,29 @@ Copy the `blender_claude/` directory to your Blender extensions folder:
 
 Then enable in **Edit > Preferences > Add-ons** — search for "Claude Code".
 
-## API Key
+## Backends
 
-The extension looks for your Anthropic API key in this order:
+The extension supports two backends, selectable in the Settings sub-panel:
 
+### CLI Backend (default)
+
+Uses your Claude Code CLI subscription (Pro/Max/Team). No API key needed — authentication is handled by the CLI.
+
+```bash
+npm install -g @anthropic-ai/claude-code
+claude login
+```
+
+Multi-turn conversations are supported via CLI session resume. The CLI handles its own tool execution.
+
+### API Backend
+
+Uses prepaid API credits from [console.anthropic.com](https://console.anthropic.com). Supports agentic tool use (scene inspection, code execution, script read/write).
+
+The extension looks for your API key in this order:
 1. **Addon preferences** — set manually in Edit > Preferences > Add-ons > Claude Code
 2. **Environment variable** — `ANTHROPIC_API_KEY`
 3. **macOS Keychain** — auto-reads from the same entry Claude Code CLI uses
-
-If you have Claude Code CLI installed, the key is detected automatically.
 
 ## Usage
 
@@ -63,14 +79,15 @@ Examples:
 ### Settings
 
 In the collapsible **Settings** sub-panel:
-- **Model** — choose between Sonnet (default), Opus, or Haiku
+- **Backend** — CLI (subscription) or API (prepaid credits)
+- **Model** — choose between Sonnet (default), Opus, or Haiku (API only)
 - **Auto-include script** — automatically send the active script as context
 - **Selection only** — send only selected text instead of the full script
-- **Show tool calls** — display tool execution details in the chat
+- **Show tool calls** — display tool execution details in the chat (API only)
 
-## Tools
+## Tools (API backend)
 
-Claude has access to these Blender tools:
+With the API backend, Claude has access to these Blender tools:
 
 | Tool | Description |
 |------|-------------|
@@ -80,16 +97,24 @@ Claude has access to these Blender tools:
 | `read_text_block` | Read a script from the Text Editor |
 | `write_text_block` | Create or update a script in the Text Editor |
 
+The CLI backend uses Claude Code's own built-in tools instead.
+
 ## Architecture
 
 ```
-User prompt → Background thread → Anthropic API (SSE streaming)
-                                        ↓
-                              Text deltas → Queue → Timer → UI update
-                              Tool calls  → Queue → Main thread execution → Results back to API
+CLI backend:
+  User prompt → Background thread → claude -p (subprocess, NDJSON streaming)
+                                          ↓
+                                Text events → Queue → Timer → UI update
+
+API backend:
+  User prompt → Background thread → Anthropic API (SSE streaming)
+                                          ↓
+                                Text deltas → Queue → Timer → UI update
+                                Tool calls  → Queue → Main thread execution → Results back to API
 ```
 
-All Blender API calls happen on the main thread via `bpy.app.timers`. The API call runs in a background thread to keep the UI responsive.
+All Blender API calls happen on the main thread via `bpy.app.timers`. Both backends run in a background thread to keep the UI responsive.
 
 ## License
 

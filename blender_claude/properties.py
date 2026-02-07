@@ -111,6 +111,7 @@ def add_display_message(scene, role, content):
 
 def clear_conversation(scene):
     """Clear both display and API conversation history."""
+    from . import cli, workspace
     state = scene.claude
     state.messages.clear()
     state.message_scroll = 0
@@ -118,3 +119,5 @@ def clear_conversation(scene):
     state.streaming_text = ""
     state.status_message = ""
     conversation_history.clear()
+    cli.clear_session()
+    workspace.clear_workspace()

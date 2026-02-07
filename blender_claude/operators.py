@@ -1,13 +1,16 @@
 """Operators for the Claude Code addon."""
 
 import json
+import os
+import platform
 import re
+import subprocess
 import threading
 
 import bpy
 from bpy.props import IntProperty, StringProperty
 
-from . import api, prompts, tools
+from . import api, cli, prompts, tools, workspace
 from .bridge import bridge
 from .preferences import get_prefs
 from .properties import add_display_message, conversation_history
@@ -215,6 +218,126 @@ def _generation_worker(api_key, model, system_prompt, messages, tool_defs,
 
 
 # ---------------------------------------------------------------------------
+# CLI backend generation worker
+# ---------------------------------------------------------------------------
+
+def _cli_generation_worker(prompt_text, system_prompt, scene_name):
+    """Background thread: streams response from claude CLI with workspace sync."""
+    global _generation_thread
+
+    try:
+        # 1. Get/create workspace and sync Blender text blocks to disk
+        ws = bridge.execute_on_main(workspace.get_workspace).wait(timeout=10)
+        bridge.execute_on_main(ws.sync_out).wait(timeout=10)
+
+        if _cancel_flag.is_set():
+            bridge.schedule(lambda s=scene_name: _on_cancelled(s))
+            return
+
+        # 2. Stream CLI response with cwd pointing at the workspace
+        accumulated_text = ""
+
+        for event in cli.stream_response(
+            prompt=prompt_text,
+            context_text=None,  # Files are on disk, no stdin needed
+            system_prompt=system_prompt,
+            cancel_flag=_cancel_flag,
+            cwd=ws.root,
+            allowed_tools=["Read", "Edit", "Write", "Glob", "Grep"],
+        ):
+            if _cancel_flag.is_set():
+                bridge.schedule(lambda s=scene_name: _on_cancelled(s))
+                return
+
+            etype = event["type"]
+
+            if etype == "text":
+                accumulated_text = event["text"]
+                bridge.set_streaming_text(accumulated_text)
+
+            elif etype == "result":
+                final_text = event.get("text", accumulated_text)
+                cost = event.get("cost_usd", 0)
+                duration = event.get("duration_ms", 0)
+
+                # 3. Sync disk changes back to Blender
+                try:
+                    changes = bridge.execute_on_main(ws.sync_back).wait(timeout=10)
+                except Exception:
+                    changes = []
+
+                # Build a simple messages list for conversation history
+                final_msgs = list(conversation_history)
+                final_msgs.append({
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": final_text}],
+                })
+
+                def _finish(t=final_text, m=final_msgs, s=scene_name,
+                            c=cost, d=duration, ch=changes):
+                    _on_complete(s, t, m)
+                    scene = bpy.data.scenes.get(s)
+                    if not scene:
+                        return
+                    # Show change summary if any files were synced
+                    if ch:
+                        summary = workspace.Workspace.format_summary(ch)
+                        add_display_message(scene, "info", summary)
+                    # Show cost info if available
+                    if c > 0:
+                        cost_str = f"${c:.4f}"
+                        dur_str = f"{d / 1000:.1f}s" if d else ""
+                        info = f"CLI: {cost_str}"
+                        if dur_str:
+                            info += f" / {dur_str}"
+                        add_display_message(scene, "info", info)
+
+                bridge.schedule(_finish)
+                return
+
+            elif etype == "error":
+                err_msg = event.get("message", "Unknown CLI error")
+                bridge.schedule(
+                    lambda m=err_msg, s=scene_name: _on_error(s, m)
+                )
+                return
+
+        # If we get here without a result event, the stream ended unexpectedly
+        # Still sync back any changes CLI may have made
+        try:
+            changes = bridge.execute_on_main(ws.sync_back).wait(timeout=10)
+        except Exception:
+            changes = []
+
+        if accumulated_text:
+            final_msgs = list(conversation_history)
+            final_msgs.append({
+                "role": "assistant",
+                "content": [{"type": "text", "text": accumulated_text}],
+            })
+
+            def _finish_fallback(t=accumulated_text, m=final_msgs,
+                                 s=scene_name, ch=changes):
+                _on_complete(s, t, m)
+                if ch:
+                    scene = bpy.data.scenes.get(s)
+                    if scene:
+                        summary = workspace.Workspace.format_summary(ch)
+                        add_display_message(scene, "info", summary)
+
+            bridge.schedule(_finish_fallback)
+        else:
+            bridge.schedule(
+                lambda s=scene_name: _on_error(s, "No response from Claude CLI")
+            )
+
+    except Exception as e:
+        bridge.schedule(
+            lambda m=str(e), s=scene_name: _on_error(s, m)
+        )
+
+
+# ---------------------------------------------------------------------------
 # Callbacks (run on main thread via bridge.schedule)
 # ---------------------------------------------------------------------------
 
@@ -290,12 +413,20 @@ class CLAUDE_OT_SendPrompt(bpy.types.Operator):
         scene = context.scene
         state = scene.claude
         prefs = get_prefs()
+        use_cli = (prefs.backend == "CLI")
 
-        # Validate
-        api_key = prefs.get_api_key()
-        if not api_key:
-            self.report({"ERROR"}, "No API key set. Check addon preferences or ANTHROPIC_API_KEY env var.")
-            return {"CANCELLED"}
+        # Validate backend availability
+        if use_cli:
+            if not cli.is_available():
+                self.report({"ERROR"},
+                            "Claude CLI not found. Install: npm install -g @anthropic-ai/claude-code")
+                return {"CANCELLED"}
+        else:
+            api_key = prefs.get_api_key()
+            if not api_key:
+                self.report({"ERROR"},
+                            "No API key set. Check addon preferences or ANTHROPIC_API_KEY env var.")
+                return {"CANCELLED"}
 
         prompt_text = state.prompt.strip()
         if not prompt_text:
@@ -306,27 +437,29 @@ class CLAUDE_OT_SendPrompt(bpy.types.Operator):
             self.report({"WARNING"}, "Already generating a response")
             return {"CANCELLED"}
 
-        # Build user message content
-        user_content = ""
-
-        # Auto-include script context
+        # Gather script context
+        script_context = ""
         if state.auto_context:
             if state.selection_only:
                 selected = _get_selected_text(context)
                 if selected:
-                    user_content += f"Selected code:\n```python\n{selected}\n```\n\n"
+                    script_context = f"Selected code:\n```python\n{selected}\n```"
             else:
                 script_name, script_content = _get_active_script_context(context)
                 if script_content:
-                    user_content += f"Current script ({script_name}):\n```python\n{script_content}\n```\n\n"
+                    script_context = f"Current script ({script_name}):\n```python\n{script_content}\n```"
 
+        # Build user content for API history
+        user_content = ""
+        if script_context:
+            user_content = script_context + "\n\n"
         user_content += prompt_text
 
         # Add to display
         add_display_message(scene, "user", prompt_text)
         state.prompt = ""
 
-        # Add to API conversation history
+        # Add to conversation history
         conversation_history.append({
             "role": "user",
             "content": user_content,
@@ -340,23 +473,41 @@ class CLAUDE_OT_SendPrompt(bpy.types.Operator):
 
         _cancel_flag.clear()
 
-        # Launch background thread
-        _generation_thread = threading.Thread(
-            target=_generation_worker,
-            args=(
-                api_key,
-                prefs.model,
-                prompts.SYSTEM_PROMPT,
-                list(conversation_history),  # Copy
-                tools.TOOL_DEFINITIONS,
-                prefs.max_tool_iterations,
-                prefs.max_tokens,
-                scene.name,
-            ),
-            daemon=True,
-        )
-        _generation_thread.start()
+        if use_cli:
+            # CLI backend: workspace-based, files on disk
+            # Enrich prompt with active script hint
+            cli_prompt = prompt_text
+            script_name, _ = _get_active_script_context(context)
+            if script_name:
+                cli_prompt = f"[Viewing '{script_name}' in Text Editor]\n\n{prompt_text}"
 
+            _generation_thread = threading.Thread(
+                target=_cli_generation_worker,
+                args=(
+                    cli_prompt,
+                    prompts.CLI_SYSTEM_PROMPT,
+                    scene.name,
+                ),
+                daemon=True,
+            )
+        else:
+            # API backend: agentic tool-use loop
+            _generation_thread = threading.Thread(
+                target=_generation_worker,
+                args=(
+                    api_key,
+                    prefs.model,
+                    prompts.SYSTEM_PROMPT,
+                    list(conversation_history),
+                    tools.TOOL_DEFINITIONS,
+                    prefs.max_tool_iterations,
+                    prefs.max_tokens,
+                    scene.name,
+                ),
+                daemon=True,
+            )
+
+        _generation_thread.start()
         return {"FINISHED"}
 
 
@@ -496,4 +647,31 @@ class CLAUDE_OT_ScrollChat(bpy.types.Operator):
         total = len(state.messages)
         state.message_scroll = max(0, min(state.message_scroll + self.direction * 5,
                                           max(0, total - 5)))
+        return {"FINISHED"}
+
+
+class CLAUDE_OT_OpenWorkspace(bpy.types.Operator):
+    """Open the workspace folder in the system file browser"""
+    bl_idname = "claude.open_workspace"
+    bl_label = "Open Workspace"
+    bl_options = {"INTERNAL"}
+
+    @classmethod
+    def poll(cls, context):
+        return workspace._workspace is not None
+
+    def execute(self, context):
+        ws = workspace._workspace
+        if ws is None or not os.path.isdir(ws.root):
+            self.report({"WARNING"}, "No workspace active")
+            return {"CANCELLED"}
+
+        path = ws.root
+        if platform.system() == "Darwin":
+            subprocess.Popen(["open", path])
+        elif platform.system() == "Windows":
+            os.startfile(path)
+        else:
+            subprocess.Popen(["xdg-open", path])
+
         return {"FINISHED"}

@@ -4,6 +4,7 @@ import textwrap
 
 import bpy
 
+from . import cli
 from .preferences import get_prefs
 
 
@@ -102,16 +103,38 @@ class CLAUDE_PT_MainPanel(bpy.types.Panel):
         state = scene.claude
         prefs = get_prefs()
 
-        # -- API key warning --
-        if not prefs.get_api_key():
-            box = layout.box()
-            box.label(text="API key not configured", icon="ERROR")
-            box.operator(
-                "preferences.addon_show",
-                text="Open Preferences",
-                icon="PREFERENCES",
-            ).module = __package__
-            return
+        # -- Backend validation --
+        use_cli = (prefs.backend == "CLI")
+
+        if use_cli:
+            if not cli.is_available():
+                box = layout.box()
+                box.label(text="Claude CLI not found", icon="ERROR")
+                box.label(text="Install: npm install -g @anthropic-ai/claude-code")
+                box.operator(
+                    "preferences.addon_show",
+                    text="Open Preferences",
+                    icon="PREFERENCES",
+                ).module = __package__
+                return
+        else:
+            if not prefs.get_api_key():
+                box = layout.box()
+                box.label(text="API key not configured", icon="ERROR")
+                box.operator(
+                    "preferences.addon_show",
+                    text="Open Preferences",
+                    icon="PREFERENCES",
+                ).module = __package__
+                return
+
+        # -- Backend indicator --
+        row = layout.row(align=True)
+        if use_cli:
+            row.label(text="CLI (Subscription)", icon="CONSOLE")
+        else:
+            row.label(text=f"API ({prefs.model.split('-')[1].title()})", icon="URL")
+        row.operator("claude.open_workspace", text="", icon="FILE_FOLDER")
 
         # -- Active script indicator --
         space = context.space_data
@@ -223,8 +246,15 @@ class CLAUDE_PT_SettingsPanel(bpy.types.Panel):
         state = context.scene.claude
         prefs = get_prefs()
 
-        layout.prop(prefs, "model", text="Model")
+        layout.prop(prefs, "backend", text="Backend")
+
+        if prefs.backend == "API":
+            layout.prop(prefs, "model", text="Model")
+
+        layout.separator()
         layout.prop(state, "auto_context")
         if state.auto_context:
             layout.prop(state, "selection_only")
-        layout.prop(state, "show_tool_calls")
+
+        if prefs.backend == "API":
+            layout.prop(state, "show_tool_calls")

@@ -2,7 +2,7 @@
 
 import bpy
 
-from . import operators, panels, preferences, properties
+from . import cli, operators, panels, preferences, properties, workspace
 from .bridge import bridge
 
 
@@ -24,6 +24,7 @@ _classes = (
     operators.CLAUDE_OT_ClearHistory,
     operators.CLAUDE_OT_CopyCode,
     operators.CLAUDE_OT_ScrollChat,
+    operators.CLAUDE_OT_OpenWorkspace,
     # Panels
     panels.CLAUDE_PT_MainPanel,
     panels.CLAUDE_PT_SettingsPanel,
@@ -42,17 +43,31 @@ def register():
 
 
 def unregister():
+    # 1. Stop the timer FIRST — prevents it from firing during teardown
     bridge.unregister()
 
+    # 2. Cancel any in-flight generation
+    operators._cancel_flag.set()
+    thread = operators._generation_thread
+    if thread and thread.is_alive():
+        thread.join(timeout=2)
+
+    # 2b. Clear CLI session state and workspace
+    cli.clear_session()
+    workspace.clear_workspace()
+
+    # 3. Remove the scene property BEFORE unregistering the PropertyGroup classes
+    #    that define it — avoids RNA_struct_free crash
     try:
         del bpy.types.Scene.claude
-    except AttributeError:
+    except (AttributeError, RuntimeError):
         pass
 
+    # 4. Unregister classes in reverse order (panels first, then PropertyGroups last)
     for cls in reversed(_classes):
         try:
             bpy.utils.unregister_class(cls)
-        except RuntimeError:
+        except (RuntimeError, ValueError):
             pass
 
     print(f"Claude Code addon unregistered ({__package__})")

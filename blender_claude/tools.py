@@ -108,6 +108,45 @@ TOOL_DEFINITIONS = [
             "required": ["name", "content"],
         },
     },
+    {
+        "name": "list_text_blocks",
+        "description": (
+            "List all text data blocks in Blender. Returns name, line count, "
+            "byte size, and the currently active text block. Call this first "
+            "to discover available scripts before reading or editing them."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
+        "name": "edit_text_block",
+        "description": (
+            "Edit a text block using find-and-replace. The old_string must match "
+            "exactly once in the text block. Use this for targeted changes instead "
+            "of rewriting the entire file with write_text_block."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Name of the text block to edit",
+                },
+                "old_string": {
+                    "type": "string",
+                    "description": "Exact text to find (must match exactly once)",
+                },
+                "new_string": {
+                    "type": "string",
+                    "description": "Replacement text",
+                },
+            },
+            "required": ["name", "old_string", "new_string"],
+        },
+    },
 ]
 
 
@@ -123,6 +162,8 @@ def execute_tool(name, tool_input):
         "execute_python": _tool_execute_python,
         "read_text_block": _tool_read_text_block,
         "write_text_block": _tool_write_text_block,
+        "list_text_blocks": _tool_list_text_blocks,
+        "edit_text_block": _tool_edit_text_block,
     }
     fn = dispatch.get(name)
     if fn is None:
@@ -333,5 +374,81 @@ def _tool_write_text_block(tool_input):
     return json.dumps({
         "status": "created" if created else "updated",
         "name": text.name,
+        "line_count": len(text.lines),
+    })
+
+
+def _tool_list_text_blocks(_input):
+    text_blocks = []
+    for text in bpy.data.texts:
+        content = text.as_string()
+        text_blocks.append({
+            "name": text.name,
+            "line_count": len(text.lines),
+            "byte_size": len(content.encode("utf-8")),
+            "is_modified": text.is_modified,
+            "filepath": text.filepath or None,
+        })
+
+    # Find the active text block
+    active_text = None
+    for window in bpy.context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type == "TEXT_EDITOR":
+                space = area.spaces.active
+                if space and space.text:
+                    active_text = space.text.name
+                    break
+        if active_text:
+            break
+
+    return json.dumps({
+        "text_blocks": text_blocks,
+        "active_text": active_text,
+        "count": len(text_blocks),
+    }, indent=2)
+
+
+def _tool_edit_text_block(tool_input):
+    name = tool_input.get("name", "")
+    old_string = tool_input.get("old_string", "")
+    new_string = tool_input.get("new_string", "")
+
+    if not name:
+        return json.dumps({"error": "No text block name provided"})
+    if not old_string:
+        return json.dumps({"error": "old_string is required"})
+
+    text = bpy.data.texts.get(name)
+    if text is None:
+        available = [t.name for t in bpy.data.texts]
+        return json.dumps({
+            "error": f"Text block '{name}' not found",
+            "available_texts": available,
+        })
+
+    content = text.as_string()
+    count = content.count(old_string)
+
+    if count == 0:
+        return json.dumps({
+            "error": "old_string not found in text block",
+            "hint": "Check for exact whitespace and indentation",
+        })
+    if count > 1:
+        return json.dumps({
+            "error": f"old_string matches {count} times (must be unique). "
+                     "Include more surrounding context to make it unique.",
+        })
+
+    new_content = content.replace(old_string, new_string, 1)
+    text.clear()
+    text.write(new_content)
+
+    return json.dumps({
+        "status": "edited",
+        "name": text.name,
+        "chars_removed": len(old_string),
+        "chars_added": len(new_string),
         "line_count": len(text.lines),
     })
