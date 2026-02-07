@@ -364,12 +364,17 @@ def _tool_write_text_block(tool_input):
     text.clear()
     text.write(content)
 
-    # Try to show it in a Text Editor area
-    for window in bpy.context.window_manager.windows:
-        for area in window.screen.areas:
-            if area.type == "TEXT_EDITOR":
-                area.spaces.active.text = text
-                break
+    # Switch Text Editor to show the written text block if setting enabled
+    try:
+        scene = bpy.context.scene
+        if not hasattr(scene, "claude") or scene.claude.auto_switch_text:
+            for window in bpy.context.window_manager.windows:
+                for area in window.screen.areas:
+                    if area.type == "TEXT_EDITOR":
+                        area.spaces.active.text = text
+                        break
+    except Exception:
+        pass
 
     return json.dumps({
         "status": "created" if created else "updated",
@@ -444,6 +449,18 @@ def _tool_edit_text_block(tool_input):
     new_content = content.replace(old_string, new_string, 1)
     text.clear()
     text.write(new_content)
+
+    # Switch Text Editor to show the edited text block
+    try:
+        scene = bpy.context.scene
+        if hasattr(scene, "claude") and scene.claude.auto_switch_text:
+            for window in bpy.context.window_manager.windows:
+                for area in window.screen.areas:
+                    if area.type == "TEXT_EDITOR":
+                        area.spaces.active.text = text
+                        break
+    except Exception:
+        pass
 
     return json.dumps({
         "status": "edited",

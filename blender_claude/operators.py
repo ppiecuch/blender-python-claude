@@ -31,6 +31,21 @@ def _extract_code_blocks(text):
     return blocks
 
 
+def _switch_text_editor_to(text_name):
+    """Switch all TEXT_EDITOR areas to display the named text block.
+
+    Called on main thread after sync when auto_switch_text is enabled.
+    """
+    text = bpy.data.texts.get(text_name)
+    if text is None:
+        return
+    for window in bpy.context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type == "TEXT_EDITOR":
+                area.spaces.active.text = text
+                return  # Switch the first one found
+
+
 def _get_active_script_context(context):
     """Get the active text block content from the Text Editor."""
     # Try the current space first
@@ -283,6 +298,9 @@ def _cli_generation_worker(prompt_text, system_prompt, scene_name):
                     if ch:
                         summary = workspace.Workspace.format_summary(ch)
                         add_display_message(scene, "info", summary)
+                        # Auto-switch to the first modified/created text block
+                        if scene.claude.auto_switch_text:
+                            _switch_text_editor_to(ch[0]["name"])
                     # Show cost info if available
                     if c > 0:
                         cost_str = f"${c:.4f}"
@@ -324,6 +342,8 @@ def _cli_generation_worker(prompt_text, system_prompt, scene_name):
                     if scene:
                         summary = workspace.Workspace.format_summary(ch)
                         add_display_message(scene, "info", summary)
+                        if scene.claude.auto_switch_text:
+                            _switch_text_editor_to(ch[0]["name"])
 
             bridge.schedule(_finish_fallback)
         else:

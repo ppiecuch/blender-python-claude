@@ -27,7 +27,6 @@ _classes = (
     operators.CLAUDE_OT_OpenWorkspace,
     # Panels
     panels.CLAUDE_PT_MainPanel,
-    panels.CLAUDE_PT_SettingsPanel,
 )
 
 

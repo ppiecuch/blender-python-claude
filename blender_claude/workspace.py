@@ -15,7 +15,6 @@ import re
 import shutil
 import sys
 import tempfile
-import time
 
 # bpy is only available at runtime inside Blender
 import bpy
@@ -47,6 +46,13 @@ def _blend_name():
     return "untitled"
 
 
+def _tmp_root():
+    """Platform-appropriate temp base directory."""
+    if sys.platform == "win32":
+        return os.environ.get("TEMP", tempfile.gettempdir())
+    return tempfile.gettempdir()
+
+
 # ---------------------------------------------------------------------------
 # Workspace class
 # ---------------------------------------------------------------------------
@@ -57,9 +63,9 @@ class Workspace:
     def __init__(self, blend_name=None):
         if blend_name is None:
             blend_name = _blend_name()
+        self._blend_name = blend_name
 
-        tmp = tempfile.gettempdir() if sys.platform != "win32" else os.environ.get("TEMP", tempfile.gettempdir())
-        self._root = os.path.join(tmp, "blender_claude", _sanitize_name(blend_name))
+        self._root = os.path.join(_tmp_root(), "blender_claude", _sanitize_name(blend_name))
         self._meta_dir = os.path.join(self._root, ".blender_claude")
 
         os.makedirs(self._root, exist_ok=True)
@@ -106,31 +112,69 @@ class Workspace:
     def _hash(content):
         return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
+    # -- Helpers --
+
+    def _unique_sanitized(self, sanitized, seen):
+        """Return a sanitized name that doesn't collide with *seen*."""
+        if sanitized not in seen:
+            return sanitized
+        base, ext = os.path.splitext(sanitized)
+        i = 2
+        while f"{base}_{i}{ext}" in seen:
+            i += 1
+        return f"{base}_{i}{ext}"
+
     # -- Sync: Blender → disk --
 
     def sync_out(self):
-        """Write all text blocks to disk. MUST run on main thread."""
+        """Write all text blocks to disk. MUST run on main thread.
+
+        Detects text-block renames via content-hash matching.
+        """
+        current_names = {t.name for t in bpy.data.texts}
+        # Reverse map: blender_name → sanitized
+        old_reverse = {v: k for k, v in self._name_map.items()}
+
         seen = set()
 
         for text in bpy.data.texts:
             name = text.name
-            sanitized = _sanitize_name(name)
-
-            # Handle collisions
-            if sanitized in seen:
-                base, ext = os.path.splitext(sanitized)
-                i = 2
-                while f"{base}_{i}{ext}" in seen:
-                    i += 1
-                sanitized = f"{base}_{i}{ext}"
-            seen.add(sanitized)
-
-            self._name_map[sanitized] = name
-
             content = text.as_string()
             content_hash = self._hash(content)
 
-            # Only write if changed
+            if name in old_reverse:
+                # Existing mapping — reuse sanitized name
+                sanitized = old_reverse[name]
+                sanitized = self._unique_sanitized(sanitized, seen)
+            else:
+                # New or renamed text block — check for rename by hash match
+                sanitized = None
+                for old_san, old_bname in list(self._name_map.items()):
+                    if (old_bname not in current_names
+                            and self._hashes.get(old_san) == content_hash):
+                        # Rename detected: old_bname → name
+                        new_san = self._unique_sanitized(
+                            _sanitize_name(name), seen)
+                        old_path = os.path.join(self._root, old_san)
+                        new_path = os.path.join(self._root, new_san)
+                        if os.path.isfile(old_path):
+                            os.rename(old_path, new_path)
+                        # Migrate state
+                        self._hashes[new_san] = self._hashes.pop(old_san, "")
+                        self._mtimes[new_san] = self._mtimes.pop(old_san, 0)
+                        self._name_map.pop(old_san, None)
+                        sanitized = new_san
+                        break
+
+                if sanitized is None:
+                    # Truly new text block
+                    sanitized = self._unique_sanitized(
+                        _sanitize_name(name), seen)
+
+            seen.add(sanitized)
+            self._name_map[sanitized] = name
+
+            # Write if content changed
             if self._hashes.get(sanitized) != content_hash:
                 filepath = os.path.join(self._root, sanitized)
                 with open(filepath, "w", encoding="utf-8") as f:
@@ -138,17 +182,15 @@ class Workspace:
                 self._hashes[sanitized] = content_hash
                 self._mtimes[sanitized] = os.path.getmtime(filepath)
 
-        # Remove files for deleted text blocks
-        reverse_map = {v: k for k, v in self._name_map.items()}
-        current_names = {t.name for t in bpy.data.texts}
-        for blender_name, sanitized in list(reverse_map.items()):
-            if blender_name not in current_names:
-                filepath = os.path.join(self._root, sanitized)
+        # Remove orphaned files (deleted text blocks not caught as renames)
+        for san, bname in list(self._name_map.items()):
+            if bname not in current_names:
+                filepath = os.path.join(self._root, san)
                 if os.path.isfile(filepath):
                     os.remove(filepath)
-                self._hashes.pop(sanitized, None)
-                self._mtimes.pop(sanitized, None)
-                self._name_map.pop(sanitized, None)
+                self._hashes.pop(san, None)
+                self._mtimes.pop(san, None)
+                del self._name_map[san]
 
         self._save_name_map()
 
@@ -158,16 +200,15 @@ class Workspace:
         """Read modified/new disk files back into Blender. MUST run on main thread.
 
         Returns list of {action, name, lines_changed} dicts.
+        Last-write-wins: disk content overwrites Blender if hashes differ.
         """
         changes = []
 
-        # Scan all files in workspace root (skip .blender_claude dir)
         for filename in os.listdir(self._root):
             filepath = os.path.join(self._root, filename)
             if not os.path.isfile(filepath) or filename.startswith("."):
                 continue
 
-            # Read file
             try:
                 with open(filepath, "r", encoding="utf-8") as f:
                     content = f.read()
@@ -181,7 +222,6 @@ class Workspace:
             # Resolve back to Blender name
             blender_name = self._name_map.get(filename, filename)
 
-            # Update or create text block
             text = bpy.data.texts.get(blender_name)
             if text is None:
                 text = bpy.data.texts.new(blender_name)
@@ -204,9 +244,6 @@ class Workspace:
                 "lines_changed": abs(new_lines - old_lines),
             })
 
-        # Check for new files not in name_map
-        # (already handled above — new files get blender_name = filename)
-
         if changes:
             self._save_name_map()
 
@@ -220,10 +257,16 @@ class Workspace:
         Call from a timer. Only does hash check when mtime differs.
         MUST run on main thread (calls sync_out / sync_back internally).
         """
-        changed = False
+        disk_changed = False
+        blender_changed = False
 
-        # Check disk → Blender (files modified externally)
-        for filename in os.listdir(self._root):
+        # Check disk side (files modified externally)
+        try:
+            entries = os.listdir(self._root)
+        except OSError:
+            return False
+
+        for filename in entries:
             filepath = os.path.join(self._root, filename)
             if not os.path.isfile(filepath) or filename.startswith("."):
                 continue
@@ -232,43 +275,40 @@ class Workspace:
             except OSError:
                 continue
             if mtime != self._mtimes.get(filename):
-                # mtime changed — check hash
                 try:
                     with open(filepath, "r", encoding="utf-8") as f:
                         content = f.read()
                 except OSError:
                     continue
                 if self._hash(content) != self._hashes.get(filename):
-                    changed = True
+                    disk_changed = True
                     break
                 else:
-                    # mtime changed but content same (e.g. touch)
                     self._mtimes[filename] = mtime
 
-        # Check Blender → disk (text blocks modified in UI)
-        if not changed:
-            for text in bpy.data.texts:
-                sanitized = None
-                # Find the sanitized name for this text block
-                for sname, bname in self._name_map.items():
-                    if bname == text.name:
-                        sanitized = sname
-                        break
-                if sanitized is None:
-                    # New text block not yet synced
-                    changed = True
+        # Check Blender side (text blocks modified in UI)
+        for text in bpy.data.texts:
+            found = False
+            for sname, bname in self._name_map.items():
+                if bname == text.name:
+                    found = True
+                    if self._hash(text.as_string()) != self._hashes.get(sname):
+                        blender_changed = True
                     break
-                content_hash = self._hash(text.as_string())
-                if content_hash != self._hashes.get(sanitized):
-                    changed = True
-                    break
+            if not found:
+                blender_changed = True  # New/renamed text block
+            if blender_changed:
+                break
 
-        if changed:
-            self.sync_out()
-            result = self.sync_back()
-            return True
+        if not disk_changed and not blender_changed:
+            return False
 
-        return False
+        # Sync: push Blender state first, then pull disk changes.
+        # Net effect: if BOTH sides changed the same file, disk wins
+        # (sync_back overwrites what sync_out just wrote).
+        self.sync_out()
+        self.sync_back()
+        return True
 
     # -- Change summary --
 
@@ -307,8 +347,17 @@ _workspace = None
 
 
 def get_workspace():
-    """Get or create the workspace for the current blend file. Main thread only."""
+    """Get or create the workspace for the current blend file. Main thread only.
+
+    Detects blend-file renames (Save As) and migrates to a new workspace.
+    """
     global _workspace
+    if _workspace is not None:
+        current = _blend_name()
+        if _workspace._blend_name != current:
+            # Blend file was renamed / Save As — migrate
+            _workspace.cleanup()
+            _workspace = None
     if _workspace is None:
         _workspace = Workspace()
     return _workspace

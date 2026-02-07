@@ -84,6 +84,18 @@ class CLAUDE_State(bpy.types.PropertyGroup):
         default=False,
     )  # type: ignore
 
+    auto_switch_text: BoolProperty(
+        name="Auto-switch to changed script",
+        description="After a prompt, switch the Text Editor to the script that was modified",
+        default=True,
+    )  # type: ignore
+
+    show_settings: BoolProperty(
+        name="Settings",
+        description="Show/hide settings section",
+        default=False,
+    )  # type: ignore
+
     # Scroll position
     message_scroll: IntProperty(
         name="Scroll",
