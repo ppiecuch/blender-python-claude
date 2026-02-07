@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "blender_claude"
-version = "0.1.0"
+version = "0.2.0"
 name = "Claude Code"
 tagline = "AI-powered Python assistant using Claude"
 maintainer = "Pawel Piecuch"

@@ -13,6 +13,10 @@ import traceback
 import bpy
 
 
+# Last text block modified/created by a tool (for auto-switch after completion)
+_last_modified_text = None
+
+
 # ---------------------------------------------------------------------------
 # Tool definitions (Anthropic format)
 # ---------------------------------------------------------------------------
@@ -354,6 +358,7 @@ def _tool_read_text_block(tool_input):
 
 
 def _tool_write_text_block(tool_input):
+    global _last_modified_text
     name = tool_input.get("name", "Script.py")
     content = tool_input.get("content", "")
 
@@ -363,6 +368,7 @@ def _tool_write_text_block(tool_input):
         text = bpy.data.texts.new(name)
     text.clear()
     text.write(content)
+    _last_modified_text = text.name
 
     # Switch Text Editor to show the written text block if setting enabled
     try:
@@ -449,6 +455,8 @@ def _tool_edit_text_block(tool_input):
     new_content = content.replace(old_string, new_string, 1)
     text.clear()
     text.write(new_content)
+    global _last_modified_text
+    _last_modified_text = text.name
 
     # Switch Text Editor to show the edited text block
     try:

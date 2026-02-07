@@ -120,16 +120,25 @@ class MainThreadBridge:
             pass
 
         # Poll workspace for external changes every ~2s (20 ticks × 100ms)
+        # Skip during generation — the CLI worker does explicit sync
         self._poll_tick += 1
         if self._poll_tick >= 20:
             self._poll_tick = 0
+            is_generating = False
             try:
-                from . import workspace as _ws
-                ws = _ws._workspace
-                if ws is not None:
-                    ws.poll_changes()
-            except Exception:
+                s = getattr(bpy.context, "scene", None)
+                if s and hasattr(s, "claude"):
+                    is_generating = s.claude.is_generating
+            except (ReferenceError, AttributeError):
                 pass
+            if not is_generating:
+                try:
+                    from . import workspace as _ws
+                    ws = _ws._workspace
+                    if ws is not None:
+                        ws.poll_changes()
+                except Exception:
+                    pass
 
         return 0.1  # Check every 100ms
 

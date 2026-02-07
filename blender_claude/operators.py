@@ -382,6 +382,11 @@ def _on_complete(scene_name, text, messages):
     if code_blocks:
         state.last_code = code_blocks[-1].strip()
 
+    # Auto-switch to last text block modified by API tools
+    if state.auto_switch_text and tools._last_modified_text:
+        _switch_text_editor_to(tools._last_modified_text)
+        tools._last_modified_text = None
+
     # Update the in-memory API conversation history
     conversation_history.clear()
     conversation_history.extend(messages)

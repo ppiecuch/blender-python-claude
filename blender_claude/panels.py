@@ -5,6 +5,7 @@ import textwrap
 import bpy
 
 from . import cli
+from . import __init__ as addon_info
 from .preferences import get_prefs
 
 
@@ -135,6 +136,8 @@ class CLAUDE_PT_MainPanel(bpy.types.Panel):
             row.label(text="CLI (Subscription)", icon="CONSOLE")
         else:
             row.label(text=f"API ({prefs.model.split('-')[1].title()})", icon="URL")
+        ver = ".".join(str(v) for v in addon_info.VERSION)
+        row.label(text=f"v{ver}")
         row.operator("claude.open_workspace", text="", icon="FILE_FOLDER")
 
         # -- Prompt input --

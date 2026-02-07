@@ -1,9 +1,15 @@
 """Claude Code - AI-powered Python assistant for Blender's Text Editor."""
 
+import atexit
+
 import bpy
 
 from . import cli, operators, panels, preferences, properties, workspace
 from .bridge import bridge
+
+
+VERSION = (0, 2, 0)
+BUILD = "2026-02-07"
 
 
 # ---------------------------------------------------------------------------
@@ -30,6 +36,11 @@ _classes = (
 )
 
 
+def _atexit_cleanup():
+    """Belt-and-suspenders cleanup if Blender exits without calling unregister."""
+    workspace.clear_workspace()
+
+
 def register():
     for cls in _classes:
         bpy.utils.register_class(cls)
@@ -37,8 +48,10 @@ def register():
     bpy.types.Scene.claude = bpy.props.PointerProperty(type=properties.CLAUDE_State)
 
     bridge.register()
+    atexit.register(_atexit_cleanup)
 
-    print(f"Claude Code addon registered ({__package__})")
+    ver = ".".join(str(v) for v in VERSION)
+    print(f"Claude Code {ver} (build {BUILD}) registered ({__package__})")
 
 
 def unregister():
@@ -54,6 +67,11 @@ def unregister():
     # 2b. Clear CLI session state and workspace
     cli.clear_session()
     workspace.clear_workspace()
+
+    try:
+        atexit.unregister(_atexit_cleanup)
+    except Exception:
+        pass
 
     # 3. Remove the scene property BEFORE unregistering the PropertyGroup classes
     #    that define it — avoids RNA_struct_free crash

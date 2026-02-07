@@ -15,6 +15,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 
 # bpy is only available at runtime inside Blender
 import bpy
@@ -68,6 +69,10 @@ class Workspace:
         self._root = os.path.join(_tmp_root(), "blender_claude", _sanitize_name(blend_name))
         self._meta_dir = os.path.join(self._root, ".blender_claude")
 
+        # Archive stale workspace from a previous session (crash, etc.)
+        if os.path.isdir(self._root) and os.listdir(self._root):
+            self._archive_existing()
+
         os.makedirs(self._root, exist_ok=True)
         os.makedirs(self._meta_dir, exist_ok=True)
 
@@ -83,6 +88,16 @@ class Workspace:
     @property
     def root(self):
         return self._root
+
+    def _archive_existing(self):
+        """Rename an existing workspace directory with a date suffix."""
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        archived = f"{self._root}_{stamp}"
+        try:
+            os.rename(self._root, archived)
+        except OSError:
+            # If rename fails (e.g. permission), just remove
+            shutil.rmtree(self._root, ignore_errors=True)
 
     # -- Name map persistence --
 
